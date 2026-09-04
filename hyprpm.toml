@@ -1,0 +1,13 @@
+[repository]
+name = "hypr-dissolve"
+authors = ["bogdan"]
+min_version = "v0.56.2"
+
+[hypr-dissolve]
+output = "build/hypr-dissolve.so"
+authors = ["bogdan"]
+description = "Распад окна на пиксели при закрытии, как в Telegram"
+build = [
+    "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
+    "cmake --build build -j`nproc`",
+]
