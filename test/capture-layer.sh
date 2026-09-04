@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Снимает закрытие ОКНА во вложенном Hyprland и печатает профиль кадров.
-# Одиночный скриншот анимацию не поймает — нужна серия.
+# Снимает закрытие СЛОЯ (rofi) во вложенном Hyprland и печатает профиль кадров.
 #
-#   ./test/run-nested.sh /tmp/dissolve && ./test/capture.sh /tmp/dissolve
+# Зачем отдельно от capture.sh: слой закрывается не диспетчером композитора, а
+# завершением процесса, и живёт на своей ветке анимаций (fadeLayersOut), а не на
+# fadeOut. Перепутать эти два пути легко, а симптом один — «эффекта нет».
 #
-# Для слоёв (rofi) есть отдельный capture-layer.sh: они закрываются иначе и
-# живут на своей ветке анимаций.
+#   ./test/run-nested.sh /tmp/dissolve && ./test/capture-layer.sh /tmp/dissolve
 set -u
 
 OUT="${1:?укажите тот же каталог, что и run-nested.sh}"
@@ -23,15 +23,14 @@ print(next(x['wl_socket'] for x in json.load(sys.stdin) if x['instance'] == want
 MON=$(hyprctl -j monitors | python3 -c "import sys, json; print(json.load(sys.stdin)[0]['name'])")
 echo "экземпляр $SIG на $WL, вывод $MON"
 
-SHOTS="$OUT/window-shots"
+SHOTS="$OUT/layer-shots"
 rm -rf "$SHOTS"
 mkdir -p "$SHOTS"
 
-# Своё окно на каждый прогон: если в кадре окажутся два окна и закроется одно,
-# профиль размеров смажется вторым и читать его будет нельзя.
-hyprctl dispatch exec \
-    "kitty --title dissolve-target --config NONE -o confirm_os_window_close=0 -o background=#2f6fb8 -o foreground=#ffffff -o font_size=20" >/dev/null
-sleep 3
+# Тема ужимается под размер вывода: вложенное окно обычно меньше настоящего
+# экрана, а rofi по умолчанию рисует список на 10 строк и не влезает.
+hyprctl dispatch exec "rofi -show drun -theme-str 'window {width: 380px;} listview {lines: 4;}'" >/dev/null
+sleep 2.5
 
 ( for i in $(seq -w 1 "$FRAMES"); do
       WAYLAND_DISPLAY="$WL" grim -o "$MON" "$SHOTS/f$i.png" 2>/dev/null
@@ -39,7 +38,9 @@ sleep 3
 CAP=$!
 
 sleep 0.3
-hyprctl dispatch closewindow title:dissolve-target >/dev/null
+# -x, а не -f: шаблон -f совпал бы с командной строкой самого скрипта, и он
+# убил бы себя. Проверено на собственной шкуре.
+pkill -x rofi
 wait $CAP
 
 python3 - "$SHOTS" <<'PY'
