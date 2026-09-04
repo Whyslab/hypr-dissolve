@@ -37,16 +37,19 @@
 #include <ranges>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 inline HANDLE         PHANDLE            = nullptr;
 inline CFunctionHook* g_pFadeoutsHook    = nullptr;
 inline CFunctionHook* g_pLayerCreateHook = nullptr;
 inline CFunctionHook* g_pSendEnterHook   = nullptr;
+inline CFunctionHook* g_pSendKeyHook     = nullptr;
 
 typedef void (*origRenderFadeouts)(void*, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE);
 typedef SP<Desktop::CLayerFadeout> (*origLayerFadeoutCreate)(PHLLS, SP<Render::IFramebuffer>, float);
 typedef void (*origSendEnter)(void*, SP<CWLSurfaceResource>, wl_array*);
+typedef void (*origSendKey)(void*, uint32_t, uint32_t, wl_keyboard_key_state);
 
 // Прогресс распада берём из штатной анимации fadeOut, но у полупрозрачных окон
 // она стартует не с 1.0 — иначе распад начинался бы с середины. Поэтому для
@@ -196,6 +199,13 @@ static void                  updateKeyLeakCodes(const std::string& RAW) {
     }
 }
 
+// Что мы вырезали из enter у конкретного клиента. Без этого починка была бы
+// половинчатой: клиенту сказано «ничего не зажато», но следом ему приезжает
+// отпускание той самой клавиши. Firefox складывает одно с другим и считает, что
+// нажатие состоялось — фуллскрин слетает ровно так же, как и без фильтра, хотя
+// keydown в страницу не приходит вовсе.
+static std::unordered_map<void*, std::unordered_set<uint32_t>> g_swallowed;
+
 static void hkSendEnter(void* thisptr, SP<CWLSurfaceResource> surface, wl_array* keys) {
     static auto PFIX   = CConfigValue<Hyprlang::INT>("plugin:dissolve:key_leak_fix");
     static auto PCODES = CConfigValue<std::string>("plugin:dissolve:key_leak_codes");
@@ -226,6 +236,7 @@ static void hkSendEnter(void* thisptr, SP<CWLSurfaceResource> surface, wl_array*
     for (size_t i = 0; i < COUNT; ++i) {
         if (std::ranges::find(g_keyLeakCodes, DATA[i]) != g_keyLeakCodes.end()) {
             dropped = true;
+            g_swallowed[thisptr].insert(DATA[i]);
             continue;
         }
 
@@ -241,6 +252,29 @@ static void hkSendEnter(void* thisptr, SP<CWLSurfaceResource> surface, wl_array*
 
     ORIG(thisptr, surface, dropped ? &filtered : keys);
     wl_array_release(&filtered);
+}
+
+static void hkSendKey(void* thisptr, uint32_t timeMs, uint32_t key, wl_keyboard_key_state state) {
+    const auto ORIG = (origSendKey)g_pSendKeyHook->m_original;
+    const auto IT   = g_swallowed.find(thisptr);
+
+    if (IT == g_swallowed.end() || IT->second.empty()) {
+        ORIG(thisptr, timeMs, key, state);
+        return;
+    }
+
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        // Настоящее нажатие: клиент теперь держит клавишу по-честному, и её
+        // отпускание он должен получить.
+        IT->second.erase(key);
+        ORIG(thisptr, timeMs, key, state);
+        return;
+    }
+
+    if (IT->second.erase(key) > 0)
+        return; // отпускание без нажатия — глотаем, мы же скрыли и нажатие
+
+    ORIG(thisptr, timeMs, key, state);
 }
 
 static void readConfig() {
@@ -467,8 +501,17 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     }
 
 
-    if (!g_pSendEnterHook)
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-dissolve] CWLKeyboardResource::sendEnter не найдена — key_leak_fix работать не будет.", CHyprColor{1.0, 0.7, 0.2, 1.0}, 8000);
+    for (auto const& match : HyprlandAPI::findFunctionsByName(PHANDLE, "sendKey")) {
+        if (!match.signature.contains("_ZN19CWLKeyboardResource7sendKeyE"))
+            continue;
+
+        g_pSendKeyHook = HyprlandAPI::createFunctionHook(PHANDLE, match.address, (void*)&hkSendKey);
+        g_pSendKeyHook->hook();
+        break;
+    }
+
+    if (!g_pSendEnterHook || !g_pSendKeyHook)
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-dissolve] хуки клавиатуры не найдены — key_leak_fix работать не будет.", CHyprColor{1.0, 0.7, 0.2, 1.0}, 8000);
 
     HyprlandAPI::reloadConfig();
 
@@ -485,7 +528,11 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_pSendEnterHook)
         g_pSendEnterHook->unhook();
 
+    if (g_pSendKeyHook)
+        g_pSendKeyHook->unhook();
+
     g_sourceAlpha.clear();
     g_layerNs.clear();
+    g_swallowed.clear();
     dissolveDestroyShader();
 }

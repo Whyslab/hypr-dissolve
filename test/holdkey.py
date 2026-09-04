@@ -17,6 +17,7 @@ import sys
 import time
 
 KEY_ESC = 1
+KEY_SPACE = 57
 EV_KEY, EV_SYN, SYN_REPORT = 0x01, 0x00, 0x00
 
 UI_DEV_CREATE = 0x5501
@@ -45,10 +46,15 @@ def emit(fd, etype, code, value):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "tap"
     hold = float(sys.argv[2]) if len(sys.argv) > 2 else 0.5
+    key  = int(sys.argv[3]) if len(sys.argv) > 3 else KEY_ESC
 
     fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
     fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-    fcntl.ioctl(fd, UI_SET_KEYBIT, KEY_ESC)
+    # Устройство обязано ЗАЯВИТЬ каждую клавишу, которую собирается слать:
+    # незаявленный код ядро молча выбрасывает, и выглядит это как «нажатие не
+    # дошло». Заявляем весь диапазон обычных клавиш.
+    for code in range(1, 128):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, code)
 
     setup = UinputSetup(bustype=0x03, vendor=0x1234, product=0x5678, version=1,
                         name=b"dissolve-test-keyboard", ff_effects_max=0)
@@ -56,15 +62,15 @@ def main():
     fcntl.ioctl(fd, UI_DEV_CREATE)
     time.sleep(1.5)  # даём композитору заметить новое устройство
 
-    emit(fd, EV_KEY, KEY_ESC, 1)
-    emit(fd, EV_SYN, SYN_REPORT, 0)
-    print("Esc нажат", flush=True)
+    if mode != "uponly":
+        emit(fd, EV_KEY, key, 1)
+        emit(fd, EV_SYN, SYN_REPORT, 0)
+        print(f"клавиша {key} нажата", flush=True)
+        time.sleep(hold)
 
-    time.sleep(hold)
-
-    emit(fd, EV_KEY, KEY_ESC, 0)
+    emit(fd, EV_KEY, key, 0)
     emit(fd, EV_SYN, SYN_REPORT, 0)
-    print("Esc отпущен", flush=True)
+    print(f"клавиша {key} отпущена", flush=True)
 
     time.sleep(0.2)
     fcntl.ioctl(fd, UI_DEV_DESTROY)

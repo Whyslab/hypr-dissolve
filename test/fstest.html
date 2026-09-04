@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>FSTEST-init</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #123; color: #eee;
+               font: 24px/1.6 monospace; display: grid; place-items: center; }
+  #state { font-size: 40px; }
+  #log { font-size: 16px; opacity: .8; white-space: pre; }
+</style>
+<div>
+  <div id="state">не в фуллскрине</div>
+  <div style="font-size:16px;opacity:.7">пробел — запросить полноэкранный режим</div>
+  <div id="log"></div>
+</div>
+<script>
+  // Всё состояние дублируем в title: его видно в hyprctl clients, значит
+  // проверку можно читать машинно, без скриншотов и без глаз.
+  let fsChanges = 0, down = 0, up = 0, last = "нет";
+  const events = [];
+
+  function report() {
+    const on = !!document.fullscreenElement;
+    document.title = `FS=${on ? "FULL" : "WIN"} fsc=${fsChanges} down=${down} up=${up} last=${last}`;
+    document.getElementById("state").textContent = on ? "ФУЛЛСКРИН" : "не в фуллскрине";
+    document.getElementById("log").textContent = events.slice(-8).join("\n");
+  }
+
+  document.addEventListener("fullscreenchange", () => {
+    fsChanges++;
+    events.push(`${Date.now() % 100000} fullscreenchange -> ${document.fullscreenElement ? "FULL" : "WIN"}`);
+    report();
+  });
+
+  addEventListener("keydown", (e) => {
+    down++; last = e.code;
+    events.push(`${Date.now() % 100000} keydown ${e.code}`);
+    if (e.code === "Space" && !document.fullscreenElement) document.documentElement.requestFullscreen();
+    report();
+  }, true);
+
+  addEventListener("keyup", (e) => {
+    up++; last = e.code + "^";
+    events.push(`${Date.now() % 100000} keyup ${e.code}`);
+    report();
+  }, true);
+
+  addEventListener("blur", () => { events.push(`${Date.now() % 100000} blur`); report(); });
+  addEventListener("focus", () => { events.push(`${Date.now() % 100000} focus`); report(); });
+
+  report();
+</script>
