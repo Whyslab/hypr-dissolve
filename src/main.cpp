@@ -11,6 +11,9 @@
 // только для тех, чьё имя перечислено в plugin:dissolve:layer_namespaces.
 // Панель, уведомления и обои — тоже слои, и рассыпать их по умолчанию не надо.
 // Попапы всегда идут мимо.
+//
+// Отдельно от анимации плагин умеет чинить утечку зажатой клавиши при смене
+// фокуса — см. комментарий у hkSendEnter. По умолчанию выключено.
 
 #define WLR_USE_UNSTABLE
 
@@ -23,6 +26,9 @@
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/protocols/core/Seat.hpp>
+
+#include <wayland-server-core.h>
 
 #include "DissolvePass.hpp"
 
@@ -36,9 +42,11 @@
 inline HANDLE         PHANDLE            = nullptr;
 inline CFunctionHook* g_pFadeoutsHook    = nullptr;
 inline CFunctionHook* g_pLayerCreateHook = nullptr;
+inline CFunctionHook* g_pSendEnterHook   = nullptr;
 
 typedef void (*origRenderFadeouts)(void*, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE);
 typedef SP<Desktop::CLayerFadeout> (*origLayerFadeoutCreate)(PHLLS, SP<Render::IFramebuffer>, float);
+typedef void (*origSendEnter)(void*, SP<CWLSurfaceResource>, wl_array*);
 
 // Прогресс распада берём из штатной анимации fadeOut, но у полупрозрачных окон
 // она стартует не с 1.0 — иначе распад начинался бы с середины. Поэтому для
@@ -137,6 +145,102 @@ static SP<Desktop::CLayerFadeout> hkLayerFadeoutCreate(PHLLS layer, SP<Render::I
 
 
     return res;
+}
+
+// ---------------------------------------------------------------------------
+// Утечка зажатой клавиши при смене фокуса
+// ---------------------------------------------------------------------------
+//
+// По протоколу wl_keyboard.enter несёт массив клавиш, зажатых НА МОМЕНТ
+// получения фокуса. Это состояние, а не события, но не все клиенты так его
+// читают: Firefox видит в массиве Escape и обрабатывает как нажатие — то есть
+// выходит из полноэкранного режима.
+//
+// Вылезает это каждый раз, когда окно или меню закрывается по нажатию Esc:
+// фокус уходит вниз раньше, чем клавишу отпустили, и Esc достаётся тому, кто
+// оказался под ним. Своё приложение можно научить закрываться на отпускании,
+// но rofi и прочие чужие бинарники так не поправить — поэтому чистим массив
+// на стороне композитора.
+//
+// Чистим ТОЛЬКО перечисленные коды, а не весь массив: играм и редакторам
+// список зажатых клавиш нужен по делу (зажатая клавиша движения при возврате
+// фокуса). Модификаторы идут отдельным путём, через sendMods, и фильтр их не
+// касается вовсе.
+static std::vector<uint32_t> g_keyLeakCodes;
+static std::string           g_keyLeakRaw = "\x01";
+
+static void                  updateKeyLeakCodes(const std::string& RAW) {
+    if (RAW == g_keyLeakRaw)
+        return;
+
+    g_keyLeakRaw = RAW;
+    g_keyLeakCodes.clear();
+
+    size_t start = 0;
+    while (start <= RAW.size()) {
+        const size_t COMMA = RAW.find(',', start);
+        std::string  part  = RAW.substr(start, COMMA == std::string::npos ? std::string::npos : COMMA - start);
+
+        try {
+            const int CODE = std::stoi(part);
+            if (CODE >= 0)
+                g_keyLeakCodes.emplace_back((uint32_t)CODE);
+        } catch (...) {
+            // мусор в конфиге — молча пропускаем, ронять композитор из-за
+            // опечатки в списке кодов было бы обидно
+        }
+
+        if (COMMA == std::string::npos)
+            break;
+        start = COMMA + 1;
+    }
+}
+
+static void hkSendEnter(void* thisptr, SP<CWLSurfaceResource> surface, wl_array* keys) {
+    static auto PFIX   = CConfigValue<Hyprlang::INT>("plugin:dissolve:key_leak_fix");
+    static auto PCODES = CConfigValue<std::string>("plugin:dissolve:key_leak_codes");
+
+    const auto  ORIG = (origSendEnter)g_pSendEnterHook->m_original;
+
+    if (!*PFIX || !keys || keys->size == 0) {
+        ORIG(thisptr, surface, keys);
+        return;
+    }
+
+    updateKeyLeakCodes(*PCODES);
+
+    if (g_keyLeakCodes.empty()) {
+        ORIG(thisptr, surface, keys);
+        return;
+    }
+
+    // Оригинальный массив принадлежит вызывающему коду и переиспользуется для
+    // остальных клиентов — правим не его, а свою копию.
+    wl_array filtered;
+    wl_array_init(&filtered);
+
+    const uint32_t* DATA  = (const uint32_t*)keys->data;
+    const size_t    COUNT = keys->size / sizeof(uint32_t);
+    bool            dropped = false;
+
+    for (size_t i = 0; i < COUNT; ++i) {
+        if (std::ranges::find(g_keyLeakCodes, DATA[i]) != g_keyLeakCodes.end()) {
+            dropped = true;
+            continue;
+        }
+
+        auto* slot = (uint32_t*)wl_array_add(&filtered, sizeof(uint32_t));
+        if (!slot) { // не осталось памяти — отдаём как есть, это честнее пустого массива
+            wl_array_release(&filtered);
+            ORIG(thisptr, surface, keys);
+            return;
+        }
+
+        *slot = DATA[i];
+    }
+
+    ORIG(thisptr, surface, dropped ? &filtered : keys);
+    wl_array_release(&filtered);
 }
 
 static void readConfig() {
@@ -316,6 +420,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:dust_life", Hyprlang::FLOAT{0.35F});
     HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:layers", Hyprlang::INT{1});
     HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:layer_namespaces", Hyprlang::STRING{"rofi"});
+    // Выключено по умолчанию: хук зовётся на каждой смене фокуса, это не
+    // рендер, и включать его стоит осознанно. 1 — это KEY_ESC из evdev.
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:key_leak_fix", Hyprlang::INT{0});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:key_leak_codes", Hyprlang::STRING{"1"});
 
     auto matches = HyprlandAPI::findFunctionsByName(PHANDLE, "renderFadeouts");
     if (matches.empty()) {
@@ -347,6 +455,21 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!g_pLayerCreateHook)
         HyprlandAPI::addNotification(PHANDLE, "[hypr-dissolve] CLayerFadeout::create не найдена — распад слоёв выключен.", CHyprColor{1.0, 0.7, 0.2, 1.0}, 8000);
 
+    for (auto const& match : HyprlandAPI::findFunctionsByName(PHANDLE, "sendEnter")) {
+        // Опять по mangled: sendEnter есть у указателя, у data device и у
+        // протокольной обёртки CWlKeyboard. Нужна именно CWLKeyboardResource.
+        if (!match.signature.contains("_ZN19CWLKeyboardResource9sendEnterE"))
+            continue;
+
+        g_pSendEnterHook = HyprlandAPI::createFunctionHook(PHANDLE, match.address, (void*)&hkSendEnter);
+        g_pSendEnterHook->hook();
+        break;
+    }
+
+
+    if (!g_pSendEnterHook)
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-dissolve] CWLKeyboardResource::sendEnter не найдена — key_leak_fix работать не будет.", CHyprColor{1.0, 0.7, 0.2, 1.0}, 8000);
+
     HyprlandAPI::reloadConfig();
 
     return {"hypr-dissolve", "Распад окна на пиксели при закрытии", "bogdan", "0.1.0"};
@@ -358,6 +481,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     if (g_pLayerCreateHook)
         g_pLayerCreateHook->unhook();
+
+    if (g_pSendEnterHook)
+        g_pSendEnterHook->unhook();
 
     g_sourceAlpha.clear();
     g_layerNs.clear();
