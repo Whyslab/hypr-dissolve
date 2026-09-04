@@ -25,7 +25,10 @@
 #include <hyprland/src/desktop/state/LayerFadeout.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/output/Monitor.hpp>
-#include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/config/ConfigManager.hpp>
+#include <hyprland/src/config/values/types/IntValue.hpp>
+#include <hyprland/src/config/values/types/FloatValue.hpp>
+#include <hyprland/src/config/values/types/StringValue.hpp>
 #include <hyprland/src/protocols/core/Seat.hpp>
 
 #include <wayland-server-core.h>
@@ -61,6 +64,69 @@ static std::unordered_map<Desktop::IFadeout*, float> g_sourceAlpha;
 // в классе только monitor/plane/zIndex/renderBox/alpha/done/effects. Ловим имя
 // в момент создания фейдаута — там слой ещё под рукой.
 static std::unordered_map<Desktop::IFadeout*, std::string> g_layerNs;
+
+// ---------------------------------------------------------------------------
+// Чтение настроек, одинаковое для обоих менеджеров конфига
+// ---------------------------------------------------------------------------
+//
+// Шаблон CConfigValue рассчитан на hyprlang-менеджер (.conf). Под Lua-конфигом
+// он валит композитор: указатель на данные лежит не там, где его ищет шаблон, а
+// несоответствие типа обрабатывается через RASSERT, то есть abort. Проверено —
+// сессия падала ассертом на первом же кадре.
+//
+// IConfigManager::getConfigValue отдаёт и указатель, и тип, и работает в обоих
+// менеджерах. Тип сверяем сами и при любом расхождении берём значение по
+// умолчанию, а не падаем.
+static Config::SConfigOptionReply cfgLookup(const std::string& NAME) {
+    if (!Config::mgr())
+        return {};
+
+    return Config::mgr()->getConfigValue(NAME);
+}
+
+static int64_t cfgInt(const std::string& NAME, int64_t fallback) {
+    const auto R = cfgLookup(NAME);
+    if (!R.dataptr || !R.type)
+        return fallback;
+
+    if (*R.type == typeid(Config::INTEGER))
+        return **(Config::INTEGER* const*)R.dataptr;
+
+    if (*R.type == typeid(bool))
+        return **(bool* const*)R.dataptr ? 1 : 0;
+
+    return fallback;
+}
+
+static float cfgFloat(const std::string& NAME, float fallback) {
+    const auto R = cfgLookup(NAME);
+    if (!R.dataptr || !R.type)
+        return fallback;
+
+    if (*R.type == typeid(Config::FLOAT))
+        return **(Config::FLOAT* const*)R.dataptr;
+
+    if (*R.type == typeid(Config::INTEGER))
+        return (float)**(Config::INTEGER* const*)R.dataptr;
+
+    return fallback;
+}
+
+static std::string cfgString(const std::string& NAME, const std::string& FALLBACK) {
+    const auto R = cfgLookup(NAME);
+    if (!R.dataptr || !R.type)
+        return FALLBACK;
+
+    if (*R.type == typeid(Config::STRING))
+        return **(Config::STRING* const*)R.dataptr;
+
+    if (*R.type == typeid(const char*)) {
+        const auto* PTR = *(const char* const*)R.dataptr;
+        return PTR ? std::string{PTR} : FALLBACK;
+    }
+
+    return FALLBACK;
+}
 
 static bool isWindowPlane(Desktop::eFadeoutPlane plane) {
     return plane == Desktop::FADEOUT_PLANE_WINDOW_TILED || plane == Desktop::FADEOUT_PLANE_WINDOW_FLOATING ||
@@ -124,12 +190,10 @@ static bool namespaceAllowed(const std::string& ns) {
 }
 
 static bool shouldDissolve(Desktop::eFadeoutPlane plane, Desktop::IFadeout* fadeout) {
-    static auto PLAYERS = CConfigValue<Hyprlang::INT>("plugin:dissolve:layers");
-
     if (isWindowPlane(plane))
         return true;
 
-    if (!isLayerPlane(plane) || !*PLAYERS || !g_pLayerCreateHook)
+    if (!isLayerPlane(plane) || !cfgInt("plugin:dissolve:layers", 1) || !g_pLayerCreateHook)
         return false;
 
     const auto IT = g_layerNs.find(fadeout);
@@ -207,17 +271,14 @@ static void                  updateKeyLeakCodes(const std::string& RAW) {
 static std::unordered_map<void*, std::unordered_set<uint32_t>> g_swallowed;
 
 static void hkSendEnter(void* thisptr, SP<CWLSurfaceResource> surface, wl_array* keys) {
-    static auto PFIX   = CConfigValue<Hyprlang::INT>("plugin:dissolve:key_leak_fix");
-    static auto PCODES = CConfigValue<std::string>("plugin:dissolve:key_leak_codes");
+    const auto ORIG = (origSendEnter)g_pSendEnterHook->m_original;
 
-    const auto  ORIG = (origSendEnter)g_pSendEnterHook->m_original;
-
-    if (!*PFIX || !keys || keys->size == 0) {
+    if (!cfgInt("plugin:dissolve:key_leak_fix", 0) || !keys || keys->size == 0) {
         ORIG(thisptr, surface, keys);
         return;
     }
 
-    updateKeyLeakCodes(*PCODES);
+    updateKeyLeakCodes(cfgString("plugin:dissolve:key_leak_codes", "1"));
 
     if (g_keyLeakCodes.empty()) {
         ORIG(thisptr, surface, keys);
@@ -278,40 +339,24 @@ static void hkSendKey(void* thisptr, uint32_t timeMs, uint32_t key, wl_keyboard_
 }
 
 static void readConfig() {
-    static auto PBLOCK    = CConfigValue<Hyprlang::FLOAT>("plugin:dissolve:block_size");
-    static auto PRISE     = CConfigValue<Hyprlang::FLOAT>("plugin:dissolve:rise");
-    static auto PSPREAD   = CConfigValue<Hyprlang::FLOAT>("plugin:dissolve:spread");
-    static auto PDRIFT    = CConfigValue<Hyprlang::FLOAT>("plugin:dissolve:drift");
-    static auto PLEAD     = CConfigValue<Hyprlang::FLOAT>("plugin:dissolve:lead");
-    static auto PWAVE     = CConfigValue<Hyprlang::FLOAT>("plugin:dissolve:wave");
-    static auto PLIFE     = CConfigValue<Hyprlang::FLOAT>("plugin:dissolve:dust_life");
+    DissolveConfig::blockSize = std::max(1.F, cfgFloat("plugin:dissolve:block_size", 4.F));
+    DissolveConfig::riseRange = std::max(0.F, cfgFloat("plugin:dissolve:rise", 200.F));
+    DissolveConfig::spread    = std::clamp(cfgFloat("plugin:dissolve:spread", 0.55F), 0.F, 1.F);
+    DissolveConfig::drift     = std::clamp(cfgFloat("plugin:dissolve:drift", 0.35F), 0.F, 2.F);
+    DissolveConfig::bodyLead  = std::max(1.F, cfgFloat("plugin:dissolve:lead", 1.15F));
+    DissolveConfig::wave      = std::clamp(cfgFloat("plugin:dissolve:wave", 0.55F), 0.F, 1.F);
+    // Верхняя граница 0.95: диапазон порогов в шейдере равен 1 - dustLife, и при
+    // dustLife = 1 он схлопнулся бы в ноль — последний блок начал бы гаснуть,
+    // когда шкала уже кончилась, и остался бы виден.
+    DissolveConfig::dustLife  = std::clamp(cfgFloat("plugin:dissolve:dust_life", 0.35F), 0.05F, 0.95F);
 
-    DissolveConfig::blockSize = std::max(1.F, (float)*PBLOCK);
-    DissolveConfig::riseRange = std::max(0.F, (float)*PRISE);
-    DissolveConfig::spread    = std::clamp((float)*PSPREAD, 0.F, 1.F);
-    DissolveConfig::drift     = std::clamp((float)*PDRIFT, 0.F, 2.F);
-    DissolveConfig::bodyLead  = std::max(1.F, (float)*PLEAD);
-    DissolveConfig::wave      = std::clamp((float)*PWAVE, 0.F, 1.F);
-    // Верхняя граница 0.95, а не 1.0. Диапазон порогов в шейдере — 1 - dustLife,
-    // и при dustLife = 1 он схлопнулся бы в ноль: последний блок начал бы гаснуть
-    // в момент, когда шкала уже кончилась, и остался бы виден на 5%.
-    DissolveConfig::dustLife  = std::clamp((float)*PLIFE, 0.05F, 0.95F);
-
-    // Именно std::string, а не Hyprlang::STRING. У CConfigValue специализация
-    // под строки написана только для std::string: она умеет достать значение из
-    // m_hlangp, где и лежат строки, заведённые плагином. Общий шаблон читает
-    // m_p, который в этом случае нулевой, — и разыменование роняет композитор
-    // на первом же кадре.
-    static auto PNS = CConfigValue<std::string>("plugin:dissolve:layer_namespaces");
-    updateNamespaceList(*PNS);
+    updateNamespaceList(cfgString("plugin:dissolve:layer_namespaces", "rofi"));
 }
 
 static void hkRenderFadeouts(void* thisptr, PHLMONITOR monitor, Desktop::eFadeoutPlane plane, PHLWORKSPACE workspace) {
-    static auto PENABLED = CConfigValue<Hyprlang::INT>("plugin:dissolve:enabled");
+    const auto ORIG = (origRenderFadeouts)g_pFadeoutsHook->m_original;
 
-    const auto  ORIG = (origRenderFadeouts)g_pFadeoutsHook->m_original;
-
-    if (!monitor || plane == Desktop::FADEOUT_PLANE_POPUP || !*PENABLED) {
+    if (!monitor || plane == Desktop::FADEOUT_PLANE_POPUP || !cfgInt("plugin:dissolve:enabled", 1)) {
         ORIG(thisptr, monitor, plane, workspace);
         return;
     }
@@ -444,20 +489,23 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("[hypr-dissolve] построен под другую версию Hyprland");
     }
 
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:enabled", Hyprlang::INT{1});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:block_size", Hyprlang::FLOAT{4.F});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:rise", Hyprlang::FLOAT{200.F});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:spread", Hyprlang::FLOAT{0.55F});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:drift", Hyprlang::FLOAT{0.35F});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:lead", Hyprlang::FLOAT{1.15F});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:wave", Hyprlang::FLOAT{0.55F});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:dust_life", Hyprlang::FLOAT{0.35F});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:layers", Hyprlang::INT{1});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:layer_namespaces", Hyprlang::STRING{"rofi"});
-    // Выключено по умолчанию: хук зовётся на каждой смене фокуса, это не
-    // рендер, и включать его стоит осознанно. 1 — это KEY_ESC из evdev.
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:key_leak_fix", Hyprlang::INT{0});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:dissolve:key_leak_codes", Hyprlang::STRING{"1"});
+    // addConfigValueV2, а не устаревший addConfigValue: старый API — это путь
+    // через hyprlang, и под Lua-конфигом настройки плагина через него просто не
+    // появляются. V2 регистрирует значение в самом менеджере, каким бы он ни был.
+    using namespace Config::Values;
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CIntValue>("plugin:dissolve:enabled", "включить распад", 1));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CFloatValue>("plugin:dissolve:block_size", "сторона блока распада, логических px", 4.F));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CFloatValue>("plugin:dissolve:rise", "на сколько блоки улетают вверх, логических px", 200.F));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CFloatValue>("plugin:dissolve:spread", "разброс скоростей блоков, 0..1", 0.55F));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CFloatValue>("plugin:dissolve:drift", "боковой разброс, доля от rise", 0.35F));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CFloatValue>("plugin:dissolve:lead", "опережение распада", 1.15F));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CFloatValue>("plugin:dissolve:wave", "волна сверху вниз, 0..1", 0.55F));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CFloatValue>("plugin:dissolve:dust_life", "сколько блок живёт после отрыва", 0.35F));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CIntValue>("plugin:dissolve:layers", "рассыпать ли слои", 1));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CStringValue>("plugin:dissolve:layer_namespaces", "чьи слои рассыпать, через запятую", "rofi"));
+    // Выключено по умолчанию: хук зовётся на каждой смене фокуса, это не рендер.
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CIntValue>("plugin:dissolve:key_leak_fix", "не отдавать зажатые клавиши окну при получении фокуса", 0));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CStringValue>("plugin:dissolve:key_leak_codes", "evdev-коды через запятую, 1 = KEY_ESC", "1"));
 
     auto matches = HyprlandAPI::findFunctionsByName(PHANDLE, "renderFadeouts");
     if (matches.empty()) {

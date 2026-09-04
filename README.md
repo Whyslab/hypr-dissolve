@@ -47,6 +47,39 @@ hyprctl plugin load ~/Projects/hypr-dissolve/build/hypr-dissolve.so
 plugin = /home/bogdan/Projects/hypr-dissolve/build/hypr-dissolve.so
 ```
 
+## Конфиг: .conf и Lua
+
+Плагин работает с обоими менеджерами конфига Hyprland. В Lua настройки
+задаются через общий `hl.config`, а не присваиванием:
+
+```lua
+hl.plugin.load("/home/…/hypr-dissolve/build/hypr-dissolve.so")
+
+hl.config({
+    plugin = {
+        dissolve = {
+            key_leak_fix = 1,
+            dust_life    = 0.35,
+        },
+    },
+})
+```
+
+`hl.plugin.dissolve.key_leak_fix = 1` **не работает**: `hl.plugin.<имя>` — не
+таблица настроек, а пространство Lua-функций плагина, и присваивание падает с
+`attempt to index a nil value`. Ошибка в Lua-конфиге роняет весь файл, поэтому
+Hyprland уходит в аварийный режим — с рабочим `SUPER + Q` и текстом ошибки
+поверх экрана. Из системы это не выкидывает, но конфиг не применяется целиком.
+
+Внутри плагина это стоило двух правок, обе обязательные для Lua:
+
+- настройки регистрируются через `addConfigValueV2`, а не через устаревший
+  `addConfigValue` — старый API идёт через hyprlang, и в Lua-режиме значения
+  плагина просто не появляются;
+- читаются они через `IConfigManager::getConfigValue`, а не через шаблон
+  `CConfigValue` — последний рассчитан на hyprlang и под Lua **валит
+  композитор ассертом** на первом же кадре.
+
 ## ⚠️ Про обновления Hyprland
 
 Плагин работает с внутренними структурами Hyprland, а их разложение меняется
