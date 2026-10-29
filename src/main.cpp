@@ -475,19 +475,16 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 }
 
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
-    PHANDLE = handle;
-
     // Плагин лезет во внутренние структуры Hyprland, разложение которых меняется
     // между версиями. Несовпадение — не «может глючить», а почти гарантированный
-    // segfault, а он уносит всю сессию с открытыми окнами. Поэтому отказываемся
-    // грузиться, а не пытаемся работать.
-    const std::string RUNNING = HyprlandAPI::getHyprlandVersion(PHANDLE).tag;
-    if (RUNNING.find(DISSOLVE_BUILT_FOR) == std::string::npos) {
-        HyprlandAPI::addNotification(PHANDLE,
-                                     "[hypr-dissolve] Собран под Hyprland " DISSOLVE_BUILT_FOR ", а запущен " + RUNNING + ". Пересоберите плагин.",
-                                     CHyprColor{1.0, 0.2, 0.2, 1.0}, 10000);
-        throw std::runtime_error("[hypr-dissolve] построен под другую версию Hyprland");
-    }
+    // segfault, а он уносит всю сессию с открытыми окнами. Поэтому первым делом,
+    // ещё до любого вызова в композитор, сверяем полный abi и отказываемся
+    // грузиться. Без addNotification: это уже вызов по чужому ABI. Hyprland сам
+    // сообщит, что плагин не загрузился.
+    if (std::string{__hyprland_api_get_hash()} != DISSOLVE_BUILT_ABI)
+        throw std::runtime_error("[hypr-dissolve] собран под abi " DISSOLVE_BUILT_ABI ", а Hyprland другой. Пересоберите плагин.");
+
+    PHANDLE = handle;
 
     // addConfigValueV2, а не устаревший addConfigValue: старый API — это путь
     // через hyprlang, и под Lua-конфигом настройки плагина через него просто не
