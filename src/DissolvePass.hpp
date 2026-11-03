@@ -9,6 +9,7 @@
 
 #include <hyprland/src/render/pass/PassElement.hpp>
 #include <hyprland/src/render/Texture.hpp>
+#include <hyprland/src/render/Context.hpp>
 #include <hyprland/src/helpers/math/Math.hpp>
 #include <hyprutils/math/Region.hpp>
 
@@ -35,12 +36,12 @@ class CDissolvePassElement : public IPassElement {
     explicit CDissolvePassElement(SData&& data);
     virtual ~CDissolvePassElement() = default;
 
-    virtual std::vector<UP<IPassElement>> draw();
+    virtual std::vector<UP<IPassElement>> draw(Render::CRenderContext& ctx);
 
-    virtual bool                         needsLiveBlur() {
+    virtual bool                         needsLiveBlur(Render::CRenderContext& ctx) {
         return false;
     }
-    virtual bool needsPrecomputeBlur() {
+    virtual bool needsPrecomputeBlur(Render::CRenderContext& ctx) {
         return false;
     }
     virtual const char* passName() {
@@ -49,13 +50,13 @@ class CDissolvePassElement : public IPassElement {
     virtual ePassElementType type() {
         return EK_CUSTOM;
     }
-    virtual std::optional<CBox> boundingBox();
-    virtual CRegion             opaqueRegion() {
+    virtual std::optional<CBox> boundingBox(Render::CRenderContext& ctx);
+    virtual CRegion             opaqueRegion(Render::CRenderContext& ctx) {
         return {};
     }
     // Частицы полупрозрачные и разлетаются за пределы окна — упрощать проход
     // нельзя, иначе Hyprland решит, что под элементом ничего рисовать не надо.
-    virtual bool disableSimplification() {
+    virtual bool disableSimplification(Render::CRenderContext& ctx) {
         return true;
     }
 

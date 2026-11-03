@@ -3,6 +3,7 @@
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Shader.hpp>
+#include <hyprland/src/render/Context.hpp>
 
 #include <cmath>
 
@@ -175,15 +176,15 @@ CDissolvePassElement::CDissolvePassElement(SData&& data) : m_data(std::move(data
     ;
 }
 
-std::optional<CBox> CDissolvePassElement::boundingBox() {
-    const auto MONITOR = g_pHyprRenderer->m_renderData.pMonitor;
+std::optional<CBox> CDissolvePassElement::boundingBox(Render::CRenderContext& ctx) {
+    const auto MONITOR = ctx.m_data.pMonitor;
     if (!MONITOR)
         return m_data.box;
 
     return m_data.box.copy().scale(1.F / MONITOR->m_scale).round();
 }
 
-std::vector<UP<IPassElement>> CDissolvePassElement::draw() {
+std::vector<UP<IPassElement>> CDissolvePassElement::draw(Render::CRenderContext& ctx) {
     if (!g_pHyprOpenGL || !m_data.tex || !m_data.tex->ok())
         return {};
 
@@ -197,9 +198,9 @@ std::vector<UP<IPassElement>> CDissolvePassElement::draw() {
         return {};
 
     CBox box = m_data.box;
-    g_pHyprRenderer->m_renderData.renderModif.applyToBox(box);
+    ctx.m_data.renderModif.applyToBox(box);
 
-    const auto MATRIX = g_pHyprRenderer->projectBoxToTarget(box);
+    const auto MATRIX = g_pHyprRenderer->projectBoxToTarget(ctx, box);
 
     glActiveTexture(GL_TEXTURE0);
     m_data.tex->bind();
@@ -232,12 +233,12 @@ std::vector<UP<IPassElement>> CDissolvePassElement::draw() {
 
     const GLsizei INSTANCES = (GLsizei)(COLS * ROWS);
 
-    m_data.damage.forEachRect([INSTANCES](const auto& RECT) {
-        g_pHyprOpenGL->scissor(&RECT, g_pHyprRenderer->m_renderData.transformDamage);
+    m_data.damage.forEachRect([&ctx, INSTANCES](const auto& RECT) {
+        g_pHyprOpenGL->scissor(ctx, &RECT, ctx.m_data.transformDamage);
         glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, INSTANCES);
     });
 
-    g_pHyprOpenGL->scissor(nullptr);
+    g_pHyprOpenGL->disableScissor();
     glBindVertexArray(0);
     m_data.tex->unbind();
 

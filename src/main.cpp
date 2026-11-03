@@ -20,6 +20,7 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
+#include <hyprland/src/render/Context.hpp>
 #include <hyprland/src/desktop/state/FadingOutState.hpp>
 #include <hyprland/src/desktop/state/Fadeout.hpp>
 #include <hyprland/src/desktop/state/LayerFadeout.hpp>
@@ -49,7 +50,7 @@ inline CFunctionHook* g_pLayerCreateHook = nullptr;
 inline CFunctionHook* g_pSendEnterHook   = nullptr;
 inline CFunctionHook* g_pSendKeyHook     = nullptr;
 
-typedef void (*origRenderFadeouts)(void*, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE);
+typedef void (*origRenderFadeouts)(void*, Render::CRenderContext&, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE);
 typedef SP<Desktop::CLayerFadeout> (*origLayerFadeoutCreate)(PHLLS, SP<Render::IFramebuffer>, float);
 typedef void (*origSendEnter)(void*, SP<CWLSurfaceResource>, wl_array*);
 typedef void (*origSendKey)(void*, uint32_t, uint32_t, wl_keyboard_key_state);
@@ -353,11 +354,11 @@ static void readConfig() {
     updateNamespaceList(cfgString("plugin:dissolve:layer_namespaces", "rofi"));
 }
 
-static void hkRenderFadeouts(void* thisptr, PHLMONITOR monitor, Desktop::eFadeoutPlane plane, PHLWORKSPACE workspace) {
+static void hkRenderFadeouts(void* thisptr, Render::CRenderContext& ctx, PHLMONITOR monitor, Desktop::eFadeoutPlane plane, PHLWORKSPACE workspace) {
     const auto ORIG = (origRenderFadeouts)g_pFadeoutsHook->m_original;
 
     if (!monitor || plane == Desktop::FADEOUT_PLANE_POPUP || !cfgInt("plugin:dissolve:enabled", 1)) {
-        ORIG(thisptr, monitor, plane, workspace);
+        ORIG(thisptr, ctx, monitor, plane, workspace);
         return;
     }
 
@@ -384,7 +385,7 @@ static void hkRenderFadeouts(void* thisptr, PHLMONITOR monitor, Desktop::eFadeou
     }
 
     if (fadeouts.empty()) {
-        ORIG(thisptr, monitor, plane, workspace);
+        ORIG(thisptr, ctx, monitor, plane, workspace);
         return;
     }
 
@@ -404,7 +405,7 @@ static void hkRenderFadeouts(void* thisptr, PHLMONITOR monitor, Desktop::eFadeou
             return true;
         });
 
-        ORIG(thisptr, monitor, plane, workspace);
+        ORIG(thisptr, ctx, monitor, plane, workspace);
 
         LIST.insert(LIST.end(), stashed.begin(), stashed.end());
     }
@@ -466,7 +467,7 @@ static void hkRenderFadeouts(void* thisptr, PHLMONITOR monitor, Desktop::eFadeou
         data.alpha  = 1.F;
         data.damage = FAKEDAMAGE;
 
-        g_pHyprRenderer->addPassElement(makeUnique<CDissolvePassElement>(std::move(data)));
+        g_pHyprRenderer->addPassElement(ctx, makeUnique<CDissolvePassElement>(std::move(data)));
     }
 }
 
