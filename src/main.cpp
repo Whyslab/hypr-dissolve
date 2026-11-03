@@ -21,6 +21,7 @@
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/Context.hpp>
+#include <hyprland/src/render/scene/SceneSelection.hpp>
 #include <hyprland/src/desktop/state/FadingOutState.hpp>
 #include <hyprland/src/desktop/state/Fadeout.hpp>
 #include <hyprland/src/desktop/state/LayerFadeout.hpp>
@@ -50,7 +51,7 @@ inline CFunctionHook* g_pLayerCreateHook = nullptr;
 inline CFunctionHook* g_pSendEnterHook   = nullptr;
 inline CFunctionHook* g_pSendKeyHook     = nullptr;
 
-typedef void (*origRenderFadeouts)(void*, Render::CRenderContext&, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE);
+typedef void (*origRenderFadeouts)(void*, Render::CRenderContext&, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE, Render::eSceneMode);
 typedef SP<Desktop::CLayerFadeout> (*origLayerFadeoutCreate)(PHLLS, SP<Render::IFramebuffer>, float);
 typedef void (*origSendEnter)(void*, SP<CWLSurfaceResource>, wl_array*);
 typedef void (*origSendKey)(void*, uint32_t, uint32_t, wl_keyboard_key_state);
@@ -354,11 +355,12 @@ static void readConfig() {
     updateNamespaceList(cfgString("plugin:dissolve:layer_namespaces", "rofi"));
 }
 
-static void hkRenderFadeouts(void* thisptr, Render::CRenderContext& ctx, PHLMONITOR monitor, Desktop::eFadeoutPlane plane, PHLWORKSPACE workspace) {
+static void hkRenderFadeouts(void* thisptr, Render::CRenderContext& ctx, PHLMONITOR monitor, Desktop::eFadeoutPlane plane, PHLWORKSPACE workspace, Render::eSceneMode mode) {
     const auto ORIG = (origRenderFadeouts)g_pFadeoutsHook->m_original;
 
-    if (!monitor || plane == Desktop::FADEOUT_PLANE_POPUP || !cfgInt("plugin:dissolve:enabled", 1)) {
-        ORIG(thisptr, ctx, monitor, plane, workspace);
+    if (!monitor || plane == Desktop::FADEOUT_PLANE_POPUP || !cfgInt("plugin:dissolve:enabled", 1) ||
+        mode != Render::eSceneMode::MONITOR) {
+        ORIG(thisptr, ctx, monitor, plane, workspace, mode);
         return;
     }
 
@@ -385,7 +387,7 @@ static void hkRenderFadeouts(void* thisptr, Render::CRenderContext& ctx, PHLMONI
     }
 
     if (fadeouts.empty()) {
-        ORIG(thisptr, ctx, monitor, plane, workspace);
+        ORIG(thisptr, ctx, monitor, plane, workspace, mode);
         return;
     }
 
@@ -405,7 +407,7 @@ static void hkRenderFadeouts(void* thisptr, Render::CRenderContext& ctx, PHLMONI
             return true;
         });
 
-        ORIG(thisptr, ctx, monitor, plane, workspace);
+        ORIG(thisptr, ctx, monitor, plane, workspace, mode);
 
         LIST.insert(LIST.end(), stashed.begin(), stashed.end());
     }
@@ -505,13 +507,25 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CIntValue>("plugin:dissolve:key_leak_fix", "не отдавать зажатые клавиши окну при получении фокуса", 0));
     HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<CStringValue>("plugin:dissolve:key_leak_codes", "evdev-коды через запятую, 1 = KEY_ESC", "1"));
 
+    // В 0.57 renderFadeouts раздвоилась: публичная четырёхаргументная обёртка
+    // зовёт приватную с eSceneMode, и окна рисуются сразу через пятиаргументную.
+    // findFunctionsByName возвращает обе в порядке таблицы символов, обёртка
+    // идёт первой — хук на matches[0] окна не перехватывал вовсе. Берём именно
+    // версию с mode; обёртка зовёт её, поэтому слои тоже подхватываются.
     auto matches = HyprlandAPI::findFunctionsByName(PHANDLE, "renderFadeouts");
-    if (matches.empty()) {
-        HyprlandAPI::addNotification(PHANDLE, "[hypr-dissolve] renderFadeouts не найдена — эффект не подключён.", CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
+    const SFunctionMatch* TARGET = nullptr;
+    for (auto const& match : matches) {
+        if (match.signature.find("eSceneMode") != std::string::npos) {
+            TARGET = &match;
+            break;
+        }
+    }
+    if (!TARGET) {
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-dissolve] renderFadeouts с eSceneMode не найдена — эффект не подключён.", CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
         throw std::runtime_error("[hypr-dissolve] hook target missing");
     }
 
-    g_pFadeoutsHook = HyprlandAPI::createFunctionHook(PHANDLE, matches[0].address, (void*)&hkRenderFadeouts);
+    g_pFadeoutsHook = HyprlandAPI::createFunctionHook(PHANDLE, TARGET->address, (void*)&hkRenderFadeouts);
     g_pFadeoutsHook->hook();
 
     // Второй хук — только ради имени слоя. Без него распад слоёв работать может,
